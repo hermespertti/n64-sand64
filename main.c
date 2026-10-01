@@ -152,121 +152,172 @@ static void paint(int cx, int cy, uint8_t m)
 /* ---------- physics ---------- */
 static inline int idx(int x, int y) { return y * GW + x; }
 
-static void step(void)
+/* ---------- v2 step: column-major phases (RSP-portable order) ----------
+ * column-major x=1..GW-2 (chunk order), y bottom-up, moved bitmap => every
+ * grain moves AT MOST once per frame (v1 let grains slide many cells).
+ * Direction randomness is pure hash(x,y,frame) — no xrnd() in the grain
+ * phase — so the RSP can recompute it bit-exactly. xrnd() is consumed only
+ * by CPU phases (sprout/ignite/burnout/rain), identical in both builds.
+ * Phases: grain move -> transform -> fire -> smoke. Fold probe = FNV-1a(G||TL).
+ */
+static uint8_t MOVED[GS] __attribute__((aligned(16)));
+
+static uint32_t jhash(int x, int y, int salt)
 {
-    /* bottom-up; alternate scan direction by frame parity */
-    int l2r = (frame_no & 1) == 0;
-    for (int y = GH - 2; y >= 1; y--) {
-        for (int k = 1; k < GW - 1; k++) {
-            int x = l2r ? k : (GW - 1 - k);
+    uint32_t h = (uint32_t)x * 2654435761u
+               + (uint32_t)y * 2246822519u
+               + (uint32_t)frame_no * 3266489917u
+               + (uint32_t)salt * 668265263u;
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    return h;
+}
+
+static int wet3(int x, int y)
+{
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            if (G[idx(x + dx, y + dy)] == M_WATER) return 1;
+    return 0;
+}
+
+static void grain_phase(int flip)
+{
+    memset(MOVED, 0, GS);
+    for (int x = 1; x < GW - 1; x++) {
+        int d = flip ? 1 : -1;                     /* diagonal/horiz priority */
+        for (int y = GH - 2; y >= 1; y--) {
             int i = idx(x, y);
+            if (MOVED[i]) continue;
             uint8_t m = G[i];
             if (m == M_AIR || m == M_WALL) continue;
 
-            if (m == M_SAND || m == M_SEED) {
-                /* dense: swap through water (water displaced up) */
-                int d = idx(x, y + 1);
-                if (is_gas(G[d])) { uint8_t t = G[d]; G[d] = m; G[i] = t; TL[d] = TL[i]; continue; }
-                int s1 = l2r ? -1 : 1;
-                int a = idx(x + s1, y + 1);
-                if (is_gas(G[a])) { uint8_t t = G[a]; G[a] = m; G[i] = t; TL[a] = TL[i]; continue; }
-                int b = idx(x - s1, y + 1);
-                if (is_gas(G[b])) { uint8_t t = G[b]; G[b] = m; G[i] = t; TL[b] = TL[i]; continue; }
-                /* seed on wet ground sprouts */
-                if (m == M_SEED) {
-                    int wet = G[idx(x, y + 1)] == M_WATER || G[idx(x - 1, y + 1)] == M_WATER ||
-                              G[idx(x + 1, y + 1)] == M_WATER;
-                    if (wet && TL[i] == 0) { G[i] = M_PLANT; TL[i] = 40 + (xrnd() & 31); spawn_plant++; }
+            if (m == M_SAND || m == M_SEED || m == M_WATER) {
+                /* down: AIR, or swap with WATER (sand/seed only) */
+                int dn = idx(x, y + 1);
+                if (G[dn] == M_AIR) {
+                    G[dn] = m; G[i] = M_AIR; MOVED[dn] = 1; continue;
                 }
-                continue;
-            }
-
-            if (m == M_WATER) {
-                /* water only moves into AIR: moving into water would merge
-                   two cells into one (silent destruction of a particle) */
-                int d = idx(x, y + 1);
-                if (G[d] == M_AIR) { G[d] = m; G[i] = M_AIR; continue; }
-                int s1 = ((xrnd() >> 16) & 1) ? -1 : 1;
-                int a = idx(x + s1, y + 1);
-                if (G[a] == M_AIR) { G[a] = m; G[i] = M_AIR; continue; }
-                int b = idx(x - s1, y + 1);
-                if (G[b] == M_AIR) { G[b] = m; G[i] = M_AIR; continue; }
-                int l = idx(x + s1, y);
-                int r = idx(x - s1, y);
-                if (G[l] == M_AIR && G[r] == M_AIR) { if ((xrnd() >> 24) & 1) { G[l] = m; G[i] = M_AIR; continue; } else { G[r] = m; G[i] = M_AIR; continue; } }
-                if (G[l] == M_AIR) { G[l] = m; G[i] = M_AIR; continue; }
-                if (G[r] == M_AIR) { G[r] = m; G[i] = M_AIR; continue; }
-                continue;
-            }
-
-            if (m == M_FIRE) {
-                /* water adjacent => both gone to smoke */
-                int touched = 0;
-                for (int dy = -1; dy <= 1 && !touched; dy++)
-                    for (int dx = -1; dx <= 1 && !touched; dx++)
-                        if (G[idx(x + dx, y + dy)] == M_WATER) touched = 1;
-                if (touched) {
-                    G[i] = M_SMOKE; TL[i] = 60;
-                    /* consume one adjacent water cell (steam) */
-                    for (int dy = -1; dy <= 1; dy++)
-                        for (int dx = -1; dx <= 1; dx++) {
-                            int j = idx(x + dx, y + dy);
-                            if (G[j] == M_WATER) { G[j] = M_AIR; erase_water++; dy = 2; break; }
-                        }
-                    continue;
+                if (m != M_WATER && G[dn] == M_WATER) {
+                    G[dn] = m; G[i] = M_WATER; MOVED[dn] = 1; continue;
                 }
-                /* ignite flammable neighbours, ~35% */
-                for (int dy = -1; dy <= 1; dy++)
-                    for (int dx = -1; dx <= 1; dx++) {
-                        int j = idx(x + dx, y + dy);
-                        if (flammable(G[j]) && ((xrnd() >> 8) & 255) < 90) {
-                            G[j] = M_FIRE; TL[j] = (uint8_t)(14 + (xrnd() & 15));
-                            spawn_fire++;
-                        }
-                    }
-                if (--TL[i] == 0) {
-                    G[i] = ((xrnd() >> 20) & 1) ? M_SMOKE : M_AIR;
-                    if (G[i] == M_SMOKE) TL[i] = 90;
+                /* diagonals: AIR (all) or WATER swap (sand/seed) */
+                int a = idx(x + d, y + 1);
+                if (G[a] == M_AIR) {
+                    G[a] = m; G[i] = M_AIR; MOVED[a] = 1; continue;
                 }
-                continue;
-            }
-
-            if (m == M_SMOKE) {
-                if (--TL[i] == 0) { G[i] = M_AIR; continue; }
-                /* rise slowly */
-                if ((frame_no & 1) == (y & 1)) {
-                    int u = idx(x, y - 1);
-                    if (G[u] == M_AIR) { G[u] = m; G[i] = M_AIR; TL[u] = TL[i]; continue; }
-                    int s1 = ((xrnd() >> 12) & 1) ? -1 : 1;
-                    int a = idx(x + s1, y - 1);
-                    if (G[a] == M_AIR) { G[a] = m; G[i] = M_AIR; TL[a] = TL[i]; }
+                if (m != M_WATER && G[a] == M_WATER) {
+                    G[a] = m; G[i] = M_WATER; MOVED[a] = 1; continue;
                 }
-                continue;
-            }
-
-            if (m == M_PLANT) {
-                /* grow upward into water or air, spend timer, need water somewhere near */
-                if (TL[i] > 0) {
-                    int wet = 0;
-                    for (int dy = -1; dy <= 1 && !wet; dy++)
-                        for (int dx = -1; dx <= 1 && !wet; dx++)
-                            if (G[idx(x + dx, y + dy)] == M_WATER) wet = 1;
-                    if (wet) {
-                        int u = idx(x, y - 1);
-                        if (is_gas(G[u])) {
-                            if (G[u] == M_WATER) erase_water++;
-                            G[u] = M_PLANT;
-                            TL[u] = (uint8_t)(30 + (xrnd() & 15));
-                            spawn_plant++;
-                            if (--TL[i] == 0) TL[i] = 1;  /* parent keeps standing */
-                        }
-                    }
+                int b = idx(x - d, y + 1);
+                if (G[b] == M_AIR) {
+                    G[b] = m; G[i] = M_AIR; MOVED[b] = 1; continue;
                 }
-                continue;
+                if (m != M_WATER && G[b] == M_WATER) {
+                    G[b] = m; G[i] = M_WATER; MOVED[b] = 1; continue;
+                }
+                /* horizontal one cell, AIR only (leveling) */
+                int h = (jhash(x, y, 7) >> 24) & 1 ? d : -d;
+                int c = idx(x + h, y);
+                if (G[c] == M_AIR && !MOVED[c]) {
+                    G[c] = m; G[i] = M_AIR; MOVED[c] = 1; continue;
+                }
             }
         }
     }
 }
+
+static void transform_phase(void)
+{
+    /* seed on wet ground sprouts (consumes xrnd) */
+    for (int x = 1; x < GW - 1; x++)
+        for (int y = GH - 2; y >= 1; y--) {
+            int i = idx(x, y);
+            if (G[i] == M_SEED && TL[i] == 0 && wet3(x, y)) {
+                G[i] = M_PLANT; TL[i] = (uint8_t)(40 + (xrnd() & 31)); spawn_plant++;
+            }
+        }
+    /* plant grows up through gas, spends its timer chain (consumes xrnd) */
+    for (int x = 1; x < GW - 1; x++)
+        for (int y = GH - 2; y >= 1; y--) {
+            int i = idx(x, y);
+            if (G[i] != M_PLANT || TL[i] == 0) continue;
+            if (!wet3(x, y)) continue;
+            int u = idx(x, y - 1);
+            if (is_gas(G[u])) {
+                if (G[u] == M_WATER) erase_water++;
+                G[u] = M_PLANT;
+                TL[u] = (uint8_t)(30 + (xrnd() & 15));
+                spawn_plant++;
+                if (--TL[i] == 0) TL[i] = 1;
+            }
+        }
+}
+
+static void fire_phase(void)
+{
+    for (int x = 1; x < GW - 1; x++)
+        for (int y = GH - 2; y >= 1; y--) {
+            int i = idx(x, y);
+            if (G[i] != M_FIRE) continue;
+            if (wet3(x, y)) {                      /* quenched -> smoke, eats one water */
+                G[i] = M_SMOKE; TL[i] = 60;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int j = idx(x + dx, y + dy);
+                        if (G[j] == M_WATER) { G[j] = M_AIR; erase_water++; dy = 2; break; }
+                    }
+                continue;
+            }
+            for (int dy = -1; dy <= 1; dy++)       /* ignite ~35% per flammable nbr */
+                for (int dx = -1; dx <= 1; dx++) {
+                    int j = idx(x + dx, y + dy);
+                    if (flammable(G[j]) && ((xrnd() >> 8) & 255) < 90) {
+                        G[j] = M_FIRE; TL[j] = (uint8_t)(14 + (xrnd() & 15));
+                        spawn_fire++;
+                    }
+                }
+            if (--TL[i] == 0) {
+                G[i] = ((xrnd() >> 20) & 1) ? M_SMOKE : M_AIR;
+                if (G[i] == M_SMOKE) TL[i] = 90;
+            }
+        }
+}
+
+static void smoke_phase(void)
+{
+    for (int x = 1; x < GW - 1; x++)
+        for (int y = GH - 2; y >= 1; y--) {
+            int i = idx(x, y);
+            if (G[i] != M_SMOKE) continue;
+            if (--TL[i] == 0) { G[i] = M_AIR; continue; }
+            if ((frame_no & 1) == (y & 1)) {       /* parity gate = 1 move/frame max */
+                int u = idx(x, y - 1);
+                if (G[u] == M_AIR) { G[u] = M_SMOKE; G[i] = M_AIR; TL[u] = TL[i]; continue; }
+                int h = (jhash(x, y, 11) >> 16) & 1 ? 1 : -1;
+                int a = idx(x + h, y - 1);
+                if (G[a] == M_AIR) { G[a] = M_SMOKE; G[i] = M_AIR; TL[a] = TL[i]; }
+            }
+        }
+}
+
+static void step(void)
+{
+    int flip = frame_no & 1;
+    grain_phase(flip);
+    transform_phase();
+    fire_phase();
+    smoke_phase();
+}
+
+
+static uint64_t grid_fold(void)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (long i = 0; i < GS; i++)  { h ^= G[i];  h *= 0x100000001b3ull; }
+    for (long i = 0; i < GS; i++)  { h ^= TL[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
 
 static void recount(void)
 {
@@ -452,10 +503,10 @@ int main(void)
             long cons_water = spawn_water - erase_water - cnt[M_WATER];
             int n = snprintf(line, sizeof line,
                 "[probe] f=%d seed=%08lX sand=%ld water=%ld fire=%ld plant=%ld "
-                "smoke=%ld spawn_s=%ld spawn_w=%ld cons_s=%ld cons_w=%ld sim_us=%lld fps1000=%ld btn=%04X\n",
+                "smoke=%ld spawn_s=%ld spawn_w=%ld cons_s=%ld cons_w=%ld sim_us=%lld fps1000=%ld btn=%04X fold=%016llX\n",
                 frame_no, RNGSEED, cnt[M_SAND], cnt[M_WATER], cnt[M_FIRE],
                 cnt[M_PLANT], cnt[M_SMOKE], spawn_sand, spawn_water,
-                cons_sand, cons_water, us_sim_total / (frame_no + 1), fps1000, bx);
+                cons_sand, cons_water, us_sim_total / (frame_no + 1), fps1000, bx, (unsigned long long)grid_fold());
             if (n > 0) probe(line);
         }
 
