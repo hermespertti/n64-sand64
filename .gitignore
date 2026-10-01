@@ -1,0 +1,5 @@
+build/
+*.z64
+*.log
+shots/
+__pycache__/
