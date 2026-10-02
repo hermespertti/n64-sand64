@@ -3,3 +3,4 @@ build/
 *.log
 shots/
 __pycache__/
+*.mp4

@@ -917,7 +917,51 @@ int main(void)
         joypad_inputs_t jin = joypad_get_inputs(JOYPAD_PORT_1);
         int bx = jin.btn.raw;
         const int NM = (int)(sizeof mats / sizeof mats[0]); (void)NM;
-#ifdef AUTOTEST
+#ifdef DICK
+        /* dick mode: pixel-cock carved in wall, sand gushes from the tip */
+        {
+            int t = frame_no;
+            if (t == 2) {
+                /* shaft: horizontal capsule x 34..94, cy 40..54 */
+                for (int y = 40; y <= 54; y++)
+                    for (int x = 40; x <= 88; x++) set_cell(x, y, M_WALL);
+                /* glans: rounded dome left */
+                for (int y = 38; y <= 56; y++)
+                    for (int x = 30; x <= 44; x++) {
+                        int dx = x - 42, dy = y - 47;
+                        if (dx * dx + dy * dy <= 64 && x <= 42) set_cell(x, y, M_WALL);
+                    }
+                /* tip rim + meatus right */
+                for (int y = 42; y <= 52; y++) set_cell(89, y, M_WALL);
+                set_cell(90, 46, M_WALL); set_cell(90, 47, M_WALL);
+                set_cell(90, 48, M_WALL); set_cell(90, 49, M_WALL);
+                /* balls */
+                for (int y = 56; y <= 68; y++)
+                    for (int x = 46; x <= 58; x++) {
+                        int dx = x - 52, dy = y - 62;
+                        if (dx * dx + dy * dy <= 42) set_cell(x, y, M_WALL);
+                    }
+                for (int y = 56; y <= 68; y++)
+                    for (int x = 64; x <= 76; x++) {
+                        int dx = x - 70, dy = y - 62;
+                        if (dx * dx + dy * dy <= 42) set_cell(x, y, M_WALL);
+                    }
+                probe("[dick] drawn");
+            }
+            /* sand gush from the tip from f=10 onward, 3 streams with jitter */
+            if (t >= 10) {
+                for (int k = 0; k < 4; k++) {
+                    int rx = 91 + (int)(xrnd() % 5);
+                    set_cell(rx, 47 + (int)(xrnd() % 3), M_SAND);
+                }
+            }
+            /* stop gushing + reveal full pile near the end */
+        }
+#endif
+#ifdef DICK
+        /* scripted cursor off in dick mode */
+#endif
+#if defined(AUTOTEST) && !defined(DICK)
         /* scripted: bouncing cursor painting; occasional material switch + rain */
         {
             int t = frame_no;
@@ -942,7 +986,8 @@ int main(void)
               frame_no, u, g_wA, wB, spawn_water - g_sA, erase_water - g_eA); probe(pl); }
         }
 #endif
-#else
+#endif
+#if !defined(AUTOTEST) && !defined(DICK)
         {
             int sx = joypad_get_axis(JOYPAD_AXIS_STICK_X);
             int sy = joypad_get_axis(JOYPAD_AXIS_STICK_Y);
