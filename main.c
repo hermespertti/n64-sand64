@@ -200,8 +200,12 @@ static void phase_V(void)
 static void phase_D(void)
 {
     int d = (frame_no & 1) ? -1 : 1;
+    /* RSP-parity: scan x AGAINST slide dir so dest checks see pre-phase
+     * state (parallel-hardware semantics). Dest is row y+1 (already
+     * finalized), so any order is actually equivalent; keep it explicit. */
     for (int y = GH - 2; y >= 1; y--) {
-        for (int x = 1; x < GW - 1; x++) {
+        for (int xs = 1; xs < GW - 1; xs++) {
+            int x = (d > 0) ? xs : (GW - 1 - xs);
             uint8_t m = G[idx(x, y)];
             if (!movable(m)) continue;
             int nx = x + d;
@@ -514,6 +518,12 @@ static void rsp_v_phase(void)
 }
 #endif
 
+static void probe(const char *line);
+#ifdef PHASE_PROF
+static uint64_t us_V;
+static uint64_t us_D, us_H, us_S, us_T, us_F;
+#endif
+
 static void step(void)
 {
 #ifdef USE_RSP
@@ -525,14 +535,32 @@ static void step(void)
 #else
     rsp_v_phase();
 #endif
+#elif defined(PHASE_PROF)
+    { uint64_t tv = TIMER_MICROS_LL(timer_ticks()); phase_V(); us_V += TIMER_MICROS_LL(timer_ticks()) - tv; }
 #else
     phase_V();
 #endif
+#ifdef PHASE_PROF
+    uint64_t t;
+    { t = TIMER_MICROS_LL(timer_ticks()); phase_D(); us_D += TIMER_MICROS_LL(timer_ticks()) - t; }
+    t = TIMER_MICROS_LL(timer_ticks()); phase_H(); us_H += TIMER_MICROS_LL(timer_ticks()) - t;
+    t = TIMER_MICROS_LL(timer_ticks()); phase_S(); us_S += TIMER_MICROS_LL(timer_ticks()) - t;
+    t = TIMER_MICROS_LL(timer_ticks()); transform_phase(); us_T += TIMER_MICROS_LL(timer_ticks()) - t;
+    t = TIMER_MICROS_LL(timer_ticks()); fire_phase(); us_F += TIMER_MICROS_LL(timer_ticks()) - t;
+    if (frame_no > 0 && (frame_no % 60) == 60 - 1) {
+        char pl[200];
+        snprintf(pl, sizeof pl, "[ph] V=%lu D=%lu H=%lu S=%lu T=%lu F=%lu usavg",
+            (unsigned long)(us_V/60), (unsigned long)(us_D/60), (unsigned long)(us_H/60),
+            (unsigned long)(us_S/60), (unsigned long)(us_T/60), (unsigned long)(us_F/60));
+        us_V=us_D=us_H=us_S=us_T=us_F=0; probe(pl);
+    }
+#else
     phase_D();
     phase_H();
     phase_S();
     transform_phase();
     fire_phase();
+#endif
 }
 
 static uint64_t grid_fold(void)
