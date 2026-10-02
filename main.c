@@ -989,22 +989,23 @@ int main(void)
 #endif
 #if !defined(AUTOTEST) && !defined(DICK)
         {
-            int sx = joypad_get_axis(JOYPAD_AXIS_STICK_X);
-            int sy = joypad_get_axis(JOYPAD_AXIS_STICK_Y);
+            int sx = jin.stick_x, sy = jin.stick_y;
             if (sx > 2000 || sx < -2000) cx += sx > 0 ? 2 : -2;
             if (sy > 2000 || sy < -2000) cy += sy > 0 ? 2 : -2;
-            if (bx & BUTTON_D_LEFT) cx -= 2;
-            if (bx & BUTTON_D_RIGHT) cx += 2;
-            if (bx & BUTTON_D_UP) cy -= 2;
-            if (bx & BUTTON_D_DOWN) cy += 2;
-            if (cx < 1) cx = 1; if (cx > GW - 2) cx = GW - 2;
-            if (cy < 1) cy = 1; if (cy > GH - 2) cy = GH - 2;
-            if (bx & BUTTON_A) paint(cx, cy, mat);
-            if (bx & BUTTON_B) paint(cx, cy, M_AIR);
-            if (bx & BUTTON_L) paint(cx, cy, M_WALL);
-            if (bx & BUTTON_R) paint(cx, cy, M_FIRE);
-            if (bx & BUTTON_C_LEFT)  mat = mats[(mat + NM - 1) % NM];
-            if (bx & BUTTON_C_RIGHT) mat = mats[(mat + 1) % NM];
+            if (jin.btn.d_left)  cx -= 2;
+            if (jin.btn.d_right) cx += 2;
+            if (jin.btn.d_up)    cy -= 2;
+            if (jin.btn.d_down)  cy += 2;
+            if (cx < 1) cx = 1;
+            if (cx > GW - 2) cx = GW - 2;
+            if (cy < 1) cy = 1;
+            if (cy > GH - 2) cy = GH - 2;
+            if (jin.btn.a) paint(cx, cy, mat);
+            if (jin.btn.b) paint(cx, cy, M_AIR);
+            if (jin.btn.l) paint(cx, cy, M_WALL);
+            if (jin.btn.r) paint(cx, cy, M_FIRE);
+            if (jin.btn.c_left)  mat = mats[(mat + NM - 1) % NM];
+            if (jin.btn.c_right) mat = mats[(mat + 1) % NM];
         }
 #endif
         step();
