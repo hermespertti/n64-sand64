@@ -10,10 +10,13 @@ all: $(ROMNAME).z64
 include $(N64_INST)/include/n64.mk
 
 C_FILES := main.c
-# rsp_sand64.S lands in stage 2 (RSP physics port)
-OBJS := $(addprefix $(BUILD_DIR)/,$(C_FILES:.c=.o))
+ASM_FILES := rsp_sand64.S
+OBJS := $(addprefix $(BUILD_DIR)/,$(C_FILES:.c=.o)) $(addprefix $(BUILD_DIR)/,$(ASM_FILES:.S=.o))
 
 CFLAGS += $(EXTRA_CFLAGS)
+ifeq ($(USE_RSP),1)
+CFLAGS += -DUSE_RSP
+endif
 
 $(BUILD_DIR)/$(ROMNAME).elf: $(OBJS)
 

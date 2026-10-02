@@ -14,6 +14,8 @@
  *  - per-cell fire/plant timers live in a parallel byte plane (TL).
  */
 #include <libdragon.h>
+
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +27,17 @@
 #define FBW  320
 #define FBH  240
 #define TOP  8   /* HUD strip height in framebuffer rows */
+
+#ifdef USE_RSP
+#include <rsp.h>
+DEFINE_RSP_UCODE(rsp_sand64);
+/* slab buffer: nsim rows + 1 halo, u16 cells */
+#define NSIM 11
+static uint16_t slab_h[48] __attribute__((aligned(16)));    /* dmem hdr mirror */
+static uint16_t slab_buf[(NSIM + 1) * GW] __attribute__((aligned(16)));
+static uint16_t slab_out[(NSIM + 1) * GW] __attribute__((aligned(16)));
+static long rsp_chunks = 0;
+#endif
 
 /* materials (single byte per cell — plane-parallel friendly) */
 enum { M_AIR, M_WALL, M_SAND, M_WATER, M_SEED, M_PLANT, M_FIRE, M_SMOKE, NMAT };
@@ -64,7 +77,7 @@ static void init_colors(void)
 static int flammable(uint8_t m) { return m == M_SEED || m == M_PLANT; }
 static int is_gas(uint8_t m)   { return m == M_AIR || m == M_WATER; }
 
-static uint8_t G  [GS] __attribute__((aligned(16)));   /* material plane */
+static uint16_t G [GS] __attribute__((aligned(16)));  /* material plane: u16 cell => 1 RSP lane = 1 cell */
 static uint8_t TL [GS] __attribute__((aligned(16)));   /* fire/plant timers */
 static uint8_t BRX[4096] __attribute__((aligned(16))); /* brush paint buffer */
 
@@ -106,7 +119,7 @@ static void set_cell(int x, int y, uint8_t m)
 
 static void build_terrain(void)
 {
-    memset(G, M_AIR, GS);
+    memset(G, M_AIR, GS * 2);
     memset(TL, 0, GS);
     /* bottom + side walls */
     for (int x = 0; x < GW; x++) set_cell(x, GH - 1, M_WALL);
@@ -163,7 +176,7 @@ static inline int idx(int x, int y) { return y * GW + x; }
  * AIR==0 makes eligibility pure zero-compare. Determinism contract: CPU
  * mirror must equal RSP output byte-for-byte (mism counter in probe).
  */
-static uint8_t HROW[GW] __attribute__((aligned(16)));
+static uint16_t HROW[GW] __attribute__((aligned(16)));
 
 static int movable(uint8_t m) { return m == M_SAND || m == M_SEED || m == M_WATER; }
 static int dense(uint8_t m)   { return m == M_SAND || m == M_SEED; }
@@ -207,7 +220,7 @@ static void phase_H(void)
 {
     int h = (frame_no & 1) ? 1 : -1;
     for (int y = GH - 2; y >= 1; y--) {
-        memcpy(HROW, &G[y * GW], GW);
+        memcpy(HROW, &G[y * GW], GW * 2);
         for (int x = 1; x < GW - 1; x++) {
             uint8_t m = HROW[x];
             if (!movable(m)) continue;
@@ -303,9 +316,218 @@ static void fire_phase(void)
         }
 }
 
+#ifdef USE_RSP
+/* V phase on RSP: chunks bottom-up, slab = rows ya..yb + halo row yb+1.
+   Sequential chaining: halo row is finalized in DRAM by the previous
+   (lower) chunk's writeback — exactly CPU bottom-up order. */
+static void probe(const char *line);
+
+#ifdef RSP_VERIFY
+static uint16_t Gcpu[GS] __attribute__((aligned(16)));
+static void phase_V_on(uint16_t *g)
+{
+    for (int y = GH - 2; y >= 1; y--)
+        for (int x = 1; x < GW - 1; x++) {
+            int i = y * GW + x, b = (y + 1) * GW + x;
+            uint16_t m = g[i];
+            if (m != M_SAND && m != M_SEED && m != M_WATER) continue;
+            if (g[b] == M_AIR) { g[b] = m; g[i] = M_AIR; continue; }
+            if ((m == M_SAND || m == M_SEED) && g[b] == M_WATER) { g[b] = m; g[i] = M_WATER; continue; }
+        }
+}
+static long mism_total = 0;
+static void rsp_verify(const char *tag)
+{
+    long mm = 0; int fx = -1, fy = -1; uint16_t fa = 0, fb2 = 0;
+    for (int i = 0; i < GS; i++)
+        if (G[i] != Gcpu[i]) {
+            mm++;
+            if (fx < 0) { fx = i % GW; fy = i / GW; fa = G[i]; fb2 = Gcpu[i]; }
+        }
+    mism_total += mm;
+    if (mm) {
+        char ln[300];
+        int n2 = snprintf(ln, sizeof ln, "[mism] f=%d %s n=%ld @(%d,%d) rsp=%u cpu=%u tot=%ld\n",
+                 frame_no, tag, mm, fx, fy, fa, fb2, mism_total);
+        if (n2 > 0) probe(ln);
+        int r = fy * GW + fx;
+        int b0 = r - 4, b1 = r + 4; if (b0 < 0) b0 = 0; if (b1 >= GS) b1 = GS - 1;
+        int o = snprintf(ln, sizeof ln, "[win] f=%d rsp:", frame_no);
+        for (int i = b0; i <= b1 && o < 250; i++) o += snprintf(ln + o, sizeof ln - o, " %u", G[i]);
+        probe(ln);
+        o = snprintf(ln, sizeof ln, "[win] f=%d cpu:", frame_no);
+        for (int i = b0; i <= b1 && o < 250; i++) o += snprintf(ln + o, sizeof ln - o, " %u", Gcpu[i]);
+        probe(ln);
+    }
+}
+#endif
+
+#ifdef RSP_PROF
+static uint64_t rsp_prof_ld, rsp_prof_run, rsp_prof_t;
+#endif
+static void rsp_v_phase(void)
+{
+    const int w3 = 3, s2 = 2, s4 = 4;
+    for (int yb = GH - 2; yb >= 1; yb -= NSIM) {   /* rows 1..GH-2 only: row 0 untouched (CPU parity) */
+        int ya = yb - NSIM + 1; if (ya < 1) ya = 1;
+        int nsim = yb - ya + 1;
+        { uint8_t *h = (uint8_t *)slab_h;   /* nsim as BIG-endian u16: RSP scalar lhu reads BE */
+          h[0] = 0; h[1] = (uint8_t)nsim; }
+        for (int i = 0; i < 8; i++) {
+            slab_h[8 + i] = 1;    /* ONE   @0x10 */
+            slab_h[16 + i] = 2;   /* TWO   @0x20 */
+            slab_h[24 + i] = 3;   /* THREE @0x30 */
+            slab_h[32 + i] = 4;   /* FOUR  @0x40 */
+            slab_h[40 + i] = 5;   /* FIVE  @0x50 */
+        }
+        (void)w3; (void)s2; (void)s4;
+        /* slab rows ya..yb + halo (yb+1) */
+        memcpy(slab_buf, &G[ya * GW], (nsim + 1) * GW * 2);
+#ifdef RSP_VERIFY
+        if (rsp_chunks == 0) {
+            char ln[220]; int o = snprintf(ln, sizeof ln, "[vin ]");
+            for (int i = 0; i < 20 && o < 180; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_buf[i]);
+            probe(ln);
+        }
+#endif
+        data_cache_hit_writeback_invalidate(slab_h, sizeof slab_h);
+        data_cache_hit_writeback_invalidate(slab_buf, (nsim + 1) * GW * 2);
+#ifdef RSP_PROF
+        uint64_t tA = TIMER_MICROS_LL(timer_ticks());
+#endif
+        rsp_load_data(slab_h, 96, 0x0000);
+        rsp_load_data(slab_buf, (nsim + 1) * GW * 2, 0x0080);
+#ifdef RSP_PROF
+        uint64_t tB = TIMER_MICROS_LL(timer_ticks());
+#endif
+        rsp_run();
+#ifdef RSP_PROF
+        uint64_t tC = TIMER_MICROS_LL(timer_ticks());
+        rsp_prof_ld += tB - tA; rsp_prof_run += tC - tB;
+#endif
+#ifdef RSP_TRACE
+        { uint32_t hv; rsp_read_data(&hv, 8, 0);
+          data_cache_hit_writeback_invalidate(&hv, 8);
+          char ln[64]; snprintf(ln, sizeof ln, "[hdr ] cpu=%d dmem0=%lu", nsim, (unsigned long)hv); probe(ln); }
+#endif
+        rsp_read_data(slab_out, (nsim + 1) * GW * 2, 0x0080);
+        data_cache_hit_writeback_invalidate(slab_out, (nsim + 1) * GW * 2);
+#ifdef RSP_PROF
+        rsp_prof_t += TIMER_MICROS_LL(timer_ticks()) - tC;
+        if ((rsp_chunks % 11) == 0) {
+            char ln[120];
+            snprintf(ln, sizeof ln, "[rsp prof] ld=%lu run=%lu rd=%lu per11chunks",
+                     (unsigned long)rsp_prof_ld, (unsigned long)rsp_prof_run, (unsigned long)(rsp_prof_t - rsp_prof_ld - rsp_prof_run));
+            probe(ln);
+            rsp_prof_ld = rsp_prof_run = rsp_prof_t = 0;
+        }
+#endif
+#ifdef RSP_TRACE
+        if (rsp_chunks == 1) {
+            static uint8_t tr[96] __attribute__((aligned(16)));
+            rsp_read_data(tr, 96, 0x1800);
+            data_cache_hit_writeback_invalidate(tr, 96);
+            const char *nm[6] = {"cur","bel","movd","cnew","bnew","ONE"};
+            char ln[200];
+            for (int m = 0; m < 6; m++) {
+                int o = snprintf(ln, sizeof ln, "[trc] %s:", nm[m]);
+                for (int i = m * 16; i < m * 16 + 16; i++)
+                    o += snprintf(ln + o, sizeof ln - o, " %u", (tr[i] << 8) | tr[i + 1]);
+                probe(ln);
+            }
+        }
+#endif
+#ifdef RSP_VERIFY
+#ifdef RSP_TRACE
+#endif
+        if (rsp_chunks == 0) {
+            char ln[220]; int o = snprintf(ln, sizeof ln, "[vout]");
+            for (int i = 0; i < 20 && o < 180; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_out[i]);
+            probe(ln);
+        }
+#endif
+#ifdef RSP_VERIFY
+        { /* compare slab_out vs CPU-applied-V on same window, cell-exact */
+            static uint16_t want[(NSIM + 1) * GW];
+            memcpy(want, slab_buf, (nsim + 1) * GW * 2);
+            for (int y = nsim - 1; y >= 0; y--)
+                for (int x = 1; x < GW - 1; x++) {
+                    int i = y * GW + x, b = i + GW;
+                    uint16_t m = want[i];
+                    if (m != M_SAND && m != M_SEED && m != M_WATER) continue;
+                    if (want[b] == M_AIR) { want[b] = m; want[i] = M_AIR; continue; }
+                    if ((m == M_SAND || m == M_SEED) && want[b] == M_WATER) { want[b] = m; want[i] = M_WATER; }
+                }
+            long mm = 0; int fx = -1;
+            for (int i = 0; i < (nsim + 1) * GW; i++)
+                if (slab_out[i] != want[i]) { mm++; if (fx < 0) fx = i; }
+            if (mm && rsp_chunks == 2 && ya == 82) {
+                char ln[230];
+                int o = snprintf(ln, sizeof ln, "[fin ]");
+                for (int i = 0; i < 40 && o < 190; i++) o += snprintf(ln + o, sizeof ln - o, "%u ", slab_buf[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[fout]");
+                for (int i = 0; i < 40 && o < 190; i++) o += snprintf(ln + o, sizeof ln - o, "%u ", slab_out[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[fin2]");
+                for (int i = GW; i < GW + 40 && o < 190; i++) o += snprintf(ln + o, sizeof ln - o, "%u ", slab_buf[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[fout2]");
+                for (int i = GW; i < GW + 40 && o < 190; i++) o += snprintf(ln + o, sizeof ln - o, "%u ", slab_out[i]);
+                probe(ln);
+            }
+            if (mm && rsp_chunks == 2) {
+                char ln[120];
+                for (int r = 0; r <= nsim; r++) {
+                    int rc = 0, f2 = -1;
+                    for (int x = 0; x < GW; x++)
+                        if (slab_out[r * GW + x] != want[r * GW + x]) { rc++; if (f2 < 0) f2 = x; }
+                    if (rc) { snprintf(ln, sizeof ln, "[rmap] slabrow=%d gridr=%d n=%d fx=%d\n", r, ya + r, rc, f2); probe(ln); }
+                }
+            }
+            if (mm && rsp_chunks < 2) {
+                char ln[220]; int o = snprintf(ln, sizeof ln, "[row-out] r%d:", fx / GW);
+                int s0 = (fx / GW) * GW;
+                for (int i = s0; i < s0 + 40 && o < 180; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_out[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[row-in ] r%d:", fx / GW);
+                for (int i = s0; i < s0 + 40 && o < 180; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_buf[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[row-wnt] r%d:", fx / GW);
+                for (int i = s0; i < s0 + 40 && o < 180; i++) o += snprintf(ln + o, sizeof ln - o, " %u", want[i]);
+                probe(ln);
+            }
+            if (mm && rsp_chunks < 30) {
+                char ln[300]; int o = snprintf(ln, sizeof ln,
+                    "[svf] ya=%d nsim=%d n=%ld @(x=%d,row=%d) rsp:", ya, nsim, mm, fx % GW, fx / GW);
+                for (int i = fx - 4; i <= fx + 4 && o < 250; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_out[i]);
+                probe(ln);
+                o = snprintf(ln, sizeof ln, "[svw] want:");
+                for (int i = fx - 4; i <= fx + 4 && o < 250; i++) o += snprintf(ln + o, sizeof ln - o, " %u", want[i]);
+                probe(ln);
+            }
+        }
+#endif
+        memcpy(&G[ya * GW], slab_out, (nsim + 1) * GW * 2);
+        rsp_chunks++;
+    }
+}
+#endif
+
 static void step(void)
 {
+#ifdef USE_RSP
+#ifdef RSP_VERIFY
+    memcpy(Gcpu, G, sizeof Gcpu);
+    phase_V_on(Gcpu);
+    rsp_v_phase();
+    rsp_verify("V");
+#else
+    rsp_v_phase();
+#endif
+#else
     phase_V();
+#endif
     phase_D();
     phase_H();
     phase_S();
@@ -316,8 +538,9 @@ static void step(void)
 static uint64_t grid_fold(void)
 {
     uint64_t h = 0xcbf29ce484222325ull;
-    for (long i = 0; i < GS; i++)  { h ^= G[i];  h *= 0x100000001b3ull; }
-    for (long i = 0; i < GS; i++)  { h ^= TL[i]; h *= 0x100000001b3ull; }
+    const uint8_t *b = (const uint8_t *)G;
+    for (long i = 0; i < GS * 2; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    for (long i = 0; i < GS; i++)     { h ^= TL[i]; h *= 0x100000001b3ull; }
     return h;
 }
 
@@ -353,9 +576,9 @@ static void render(uint32_t *pix, int cx, int cy, int mat)
     /* cells 4x */
     for (int gy = 0; gy < GH; gy++) {
         uint32_t *row0 = pix + (TOP + gy * SCALE) * FBW;
-        const uint8_t *grow = G + gy * GW;
+        const uint16_t *grow = G + gy * GW;
         for (int gx = 0; gx < GW; gx++) {
-            uint8_t m = grow[gx];
+            uint8_t m = (uint8_t)grow[gx];
             uint32_t c = mcol[m];
             if ((m == M_SAND || m == M_WATER) && ((gx * 31 + gy * 17 + gx * gy) & 8))
                 c = c ^ ((m == M_SAND) ? 0x080800 : 0x000808); /* mottling */
@@ -416,6 +639,10 @@ int main(void)
     timer_init();
     joypad_init();
 
+#ifdef USE_RSP
+    rsp_init();
+    rsp_load(&rsp_sand64);
+#endif
     build_terrain();
 
     int cx = GW / 2, cy = GH / 2, mat = M_SAND;
@@ -506,10 +733,16 @@ int main(void)
             long cons_water = spawn_water - erase_water - cnt[M_WATER];
             int n = snprintf(line, sizeof line,
                 "[probe] f=%d seed=%08lX sand=%ld water=%ld fire=%ld plant=%ld "
-                "smoke=%ld spawn_s=%ld spawn_w=%ld cons_s=%ld cons_w=%ld sim_us=%lld fps1000=%ld btn=%04X fold=%016llX\n",
+                "smoke=%ld spawn_s=%ld spawn_w=%ld cons_s=%ld cons_w=%ld sim_us=%lld fps1000=%ld btn=%04X fold=%016llX rsp=%ld\n",
                 frame_no, RNGSEED, cnt[M_SAND], cnt[M_WATER], cnt[M_FIRE],
                 cnt[M_PLANT], cnt[M_SMOKE], spawn_sand, spawn_water,
-                cons_sand, cons_water, us_sim_total / (frame_no + 1), fps1000, bx, (unsigned long long)grid_fold());
+                cons_sand, cons_water, us_sim_total / (frame_no + 1), fps1000, bx, (unsigned long long)grid_fold(),
+#ifdef USE_RSP
+                rsp_chunks
+#else
+                0L
+#endif
+                );
             if (n > 0) probe(line);
         }
 
