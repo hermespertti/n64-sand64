@@ -15,7 +15,7 @@ simulation step is bit-for-bit reproducible.
 | v3    | Row-phase vector-portable engine (V->D->H) | done |
 | 2a    | RSP V-phase offload, verified | done |
 | 2b    | **Fused per-row V+D+H on RSP** | done: mism=0 / 2550 frames |
-| 2c    | Smoke (S) phase fusion | in progress |
+| 2c    | Smoke (S) phase fused into the per-row RSP pass | ✅ done |
 | --    | DICK mode (`-DDICK`) | done |
 
 Verified against a CPU oracle in the same ROM: **grid mismatches = 0**,

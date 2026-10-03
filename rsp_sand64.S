@@ -1,4 +1,17 @@
-/* sand64 fused RSP ucode — per-row pipeline (contract = CPU live steps):
+/* Register legend (scalar):
+ *   s0 = vec base addr      s1 = (free)      s2 = row0-skip flag
+ *   s3 = up-row vec addr    s4 = phase mask   s5 = mask table addr
+ *   s6 = row counter k      s7 = dirflag      t0 = nsim
+ *   t1 = row base addr      t4 = vec counter  t5 = vec byte offset
+ *   t6 = neighbor win addr  t7 = scratch slot t8 = scratch cmp
+ *   t9 = up-row base        $v26 = compare accumulator (VCOL)
+ * Vector constants:  $v16=ONE  $v17=TWO(2)  $v18=THREE(3)  $v19=FOUR(4)
+ *   $v20=FIVE(5)  $v30=TLX  (0x0100: smoke floor / TL tick, re-loaded per S row)
+ * Cell encoding: low byte = material id; SMOKE carries TL in high byte
+ *   (mat<<8 | TL), so "smoke" == value >= 0x0700 in SM700 compares.
+ * Phase mask (hdr byte 4): 1=V 2=D 4=H 8=S, all fused per row, bottom-up.
+ *
+ * Old contract header: sand64 fused RSP ucode — per-row pipeline (contract = CPU live steps):
  *   slab k=nsim-1 .. 0:
  *     V(k): cur(k),bel(k)->final row k+1 written back
  *     (slab row k+1 now finalized; row k = post-V)
@@ -29,6 +42,7 @@
     .equ H19M,  0x0C40
     .equ H0I,   0x0C50
     .equ H19I,  0x0C60
+    .equ U0,    0x0A80        /* smoke 'up' row for k==0: CPU loads grid row ya-1 */
     .equ S1,    0x0D80
     .equ S2,    0x0EC0   /* == S1+320; S1+t5+320 aliases here */
 /* dsel: s5 = DMEM addr of D source-validity mask for vector t4
@@ -72,15 +86,15 @@ _start:
     vsub $v00, $v00, $v00
     lhu  t0, 0($0)
     slti t8, t0, 1
-    bnez t8, ncl
+    bnez t8, nsim_bad
     nop
-    slti t8, t0, 9                 /* NSIM=8 */
-    beqz t8, ncl
+    slti t8, t0, 8                 /* NSIM=7 */
+    beqz t8, nsim_bad
     nop
-    j    ncl2
+    j    nsim_store
     nop
-ncl: li t0, 0
-ncl2: sh   t0, 0($0)                 /* halfword: must NOT clobber dirflag@2 / mask@4 */
+nsim_bad: li t0, 0
+nsim_store: sh   t0, 0($0)                 /* halfword: must NOT clobber dirflag@2 / mask@4 */
     lbu  s7, 2($0)                 /* dirflag: 1 => d=-1 (asc), h=+1 */
     lbu  s4, 4($0)                 /* phase mask: 1=V 2=D 4=H */
     lbu  s2, 5($0)                 /* row0 skip: k=0 is grid row 0 (sky): no source moves */
@@ -93,14 +107,14 @@ ncl2: sh   t0, 0($0)                 /* halfword: must NOT clobber dirflag@2 / m
     lqv  $v20, 80, $0
     addi s6, t0, -1                /* k */
 
-rloop:
-    bltz s6, rdone
+row_loop:
+    bltz s6, row_done
     nop
     bnez s6, 9f
     nop
     beqz s2, 9f                    /* k==0 in a mid-grid chunk: process */
     nop
-    j    rnext                     /* k==0 == grid row 0 (sky): never a source */
+    j    row_next                     /* k==0 == grid row 0 (sky): never a source */
     nop
 9:
     sll  t1, s6, 8
@@ -111,12 +125,12 @@ rloop:
 
 /* ---- V(k) ascending ---- */
     andi t8, s4, 1
-    beqz t8, vdone
+    beqz t8, v_done
     nop
     li   t4, NVEC
-vv:
+v_vec:
     addi t4, t4, -1
-    bltz t4, vdone
+    bltz t4, v_done
     nop
     sll  t5, t4, 4
     add  s0, t1, t5
@@ -161,41 +175,41 @@ vv:
     vand  $v15, $v10, $v01
     vor   $v14, $v14, $v15
     sqv   $v14, 320, s0            /* row k+1 finalized */
-    j    vv
+    j    v_vec
     nop
 
 /* ---- D(k): snapshot semantics; scans mirror dir ---- */
-vdone:
+v_done:
     andi t8, s4, 2
-    beqz t8, ddone
+    beqz t8, d_done
     nop
-    beqz s7, dpos
-    li   t4, NVEC                /* d=-1 first: start 20, dv decrements to 19 */
-    j    dv
+    beqz s7, d_fwd
+    li   t4, NVEC                /* d=-1 first: start 20, d_vec_rev decrements to 19 */
+    j    d_vec_rev
     nop
-dpos:
-    li   t4, -1                  /* d=+1: start -1, dvb increments to 0 */
-dv:
-    beqz s7, dvb
+d_fwd:
+    li   t4, -1                  /* d=+1: start -1, d_vec_fwd increments to 0 */
+d_vec_rev:
+    beqz s7, d_vec_fwd
     nop
     addi t4, t4, -1
-    bltz t4, dmerge
+    bltz t4, d_merge
     nop
-    j    dload
+    j    d_load
     nop
-dvb:
+d_vec_fwd:
     addi t4, t4, 1
     slti t8, t4, NVEC
-    beqz t8, dmerge
+    beqz t8, d_merge
     nop
-dload:
+d_load:
     sll  t5, t4, 4
     add  s0, t1, t5
     sub  t7, s0, t1
     addi t7, t7, S1                /* S1 slot for cell j */
     lqv  $v01, 0, s0               /* cur (post-V) */
     lqv  $v02, 320, s0             /* bel (final row k+1) */
-    bnez s7, dneg
+    bnez s7, d_back
     nop
     /* d=+1: belD win (B+320)+2 ; smat win B-2 */
     addi t6, s0, 322
@@ -205,9 +219,9 @@ dload:
     lqv  $v04, 0, t6
     lqv  $v04, 2, 0, s0
     dsel
-    j    dc
+    j    d_calc
     nop
-dneg:
+d_back:
     /* d=-1: belD win (B+320)-2 ; smat win B+2 */
     addi t6, s0, 318
     lqv  $v03, 0, t6
@@ -216,7 +230,7 @@ dneg:
     lqv  $v04, 0, t6
     lqv  $v04, 14, 16, s0
     dsel
-dc:
+d_calc:
     lqv  $v29, 0, s5               /* source-validity mask */
     /* mov = 2<=cur<5 */
     vsubc $v26, $v01, $v17
@@ -300,28 +314,28 @@ dc:
     vor   $v02, $v02, $v04         /* bel_final */
     addi  t6, t7, 320
     sqv   $v02, 0, t6              /* S2 slot */
-    j    dv
+    j    d_vec_rev
     nop
 
 /* ---- merge S1 -> row k AND S2 -> row k+1 ---- */
-dmerge:
+d_merge:
     li   t4, NVEC
-m1:
+merge_s1:
     addi t4, t4, -1
-    bltz t4, m2
+    bltz t4, merge_s2
     nop
     sll  t5, t4, 4
     addi t6, t5, S1
     lqv  $v13, 0, t6
     add  t6, t1, t5
     sqv  $v13, 0, t6
-    j    m1
+    j    merge_s1
     nop
-m2:
+merge_s2:
     li   t4, NVEC
-m2b:
+merge_s2b:
     addi t4, t4, -1
-    bltz t4, ddone
+    bltz t4, d_done
     nop
     sll  t5, t4, 4
     addi t6, t5, S2
@@ -329,33 +343,32 @@ m2b:
     addi t7, t1, 320
     add  t7, t7, t5
     sqv  $v14, 0, t7
-    j    m2b
+    j    merge_s2b
     nop
-ddone:
+d_done:
 
 /* ---- H(k): h=-d; snapshot -> S1 ---- */
-hstart:
+h_start:
     andi t8, s4, 4
-    beqz t8, hdone
+    beqz t8, h_done
     nop
     lqv  $v31, 64, $0              /* sentinel: const 4 */
     li   t6, S1
     sqv  $v31, 0, t6
     li   t4, NVEC
-hv:
+h_vec:
     addi t4, t4, -1
-    bltz t4, hmerge
+    bltz t4, h_merge
     nop
     sll  t5, t4, 4
     add  s0, t1, t5
     sub  t7, s0, t1
     addi t7, t7, S1
     lqv  $v01, 0, s0               /* cur (post-D, merged) */
-    bnez t4, nohp
+    bnez t4, h_skip_edge
     nop
-    sqv  $v01, 96, $0              /* probe: row cur cells for v0 -> 0x60 */
-nohp:
-    bnez s7, hneg
+h_skip_edge:
+    bnez s7, h_back
     nop
     /* h=-1: nb win B-2, smat win B+2 */
     addi t6, s0, -2
@@ -365,9 +378,9 @@ nohp:
     lqv  $v03, 0, t6
     lqv  $v03, 14, 16, s0
     hsel
-    j    hc
+    j    h_calc
     nop
-hneg:
+h_back:
     /* h=+1: nb win B+2, smat win B-2 */
     addi t6, s0, 2
     lqv  $v02, 0, t6
@@ -376,7 +389,7 @@ hneg:
     lqv  $v03, 0, t6
     lqv  $v03, 2, 0, s0
     hsel
-hc:
+h_calc:
     lqv  $v29, 0, s5
     vsubc $v26, $v01, $v17
     vsub  $v04, $v00, $v00
@@ -401,33 +414,88 @@ hc:
     vand  $v01, $v01, $v11
     vand  $v03, $v03, $v10
     vor   $v01, $v01, $v03
-    bnez t4, nohp2
+    bnez t4, h_skip_edge2
     nop
-    sqv  $v01, 112, $0             /* probe: cnew v0 -> 0x70 */
-nohp2:
+h_skip_edge2:
     sqv   $v01, 0, t7
-    j    hv
+    j    h_vec
     nop
 
 /* ---- merge S1 -> row k (S2 merged in D phase) ---- */
-hmerge:
+h_merge:
     li   t4, NVEC
-m3:
+merge_s1_h:
     addi t4, t4, -1
-    bltz t4, hdone
+    bltz t4, h_done
     nop
     sll  t5, t4, 4
     addi t6, t5, S1
     lqv  $v13, 0, t6
     add  t6, t1, t5
     sqv  $v13, 0, t6
-    j    m3
+    j    merge_s1_h
     nop
-hdone:
-rnext:
+h_done:
+/* ---- S(k): smoke rises one row/frame; TL-- only when it moves.
+ * Encoding (mat<<8)|TL... NO: (TL<<8)|mat, smoke mat=7.
+ *   smoke= cur >= 0x0100       (only smoke carries a TL high byte)
+ *   t1   = cur - 0x0100      ($v30=TLX)   TL-- (mat unchanged)
+ *   moved= smoke & upAIR & (t1 >= 0x0100)  [TL was >=2]
+ *   src  = moved|expired ? AIR : cur (blocked smoke keeps TL)
+ *   up   = moved ? t1 : up
+ * ---- */
+    andi t8, s4, 8
+    beqz t8, s_done
+    nop
+    lqv  $v30, 112, $0             /* TLX @0x70 (header zone: slab DMA starts 0x80) */
+    li   t9, 320
+    sub  t9, t1, t9                /* up-row k-1 base */
+    bnez s6, s_up_ok
+    nop
+    beqz s2, s_up_u0               /* k==0 mid-grid: up = grid row ya-1 via U0 */
+    nop
+    j    s_done                    /* grid row 0 sky: CPU phase_S never visits */
+    nop
+s_up_u0:
+    li   t9, U0
+s_up_ok:
+    li   t4, NVEC
+s_vec:
+    addi t4, t4, -1
+    bltz t4, s_done
+    nop
+    sll  t5, t4, 4
+    add  s0, t1, t5
+    add  s3, t9, t5
+    lqv  $v01, 0, s0               /* cur (encoded) */
+    lqv  $v02, 0, s3               /* up-row current state */
+    vsub  $v05, $v01, $v30         /* t1 = cur - 0x0100 (BEFORE clear) */
+    vsubc $v26, $v01, $v30
+    vsub  $v03, $v00, $v00         /* cur < 0x0100 = NOT smoke (encoding: only
+                                      smoke ever carries a TL high byte) */
+    vnor  $v04, $v03, $v03         /* smoke = cur >= 0x0100 */
+    vsubc $v26, $v02, $v16
+    vsub  $v08, $v00, $v00         /* upAIR (up < 1) */
+    vand  $v09, $v04, $v08         /* vacate = smoke & upAIR */
+    vsubc $v26, $v05, $v30
+    vsub  $v10, $v00, $v00         /* t1 < 0x100 = expired */
+    vnor  $v10, $v10, $v10         /* alive */
+    vand  $v10, $v09, $v10         /* moved = vacate & alive */
+    vnor  $v11, $v09, $v09
+    vand  $v01, $v01, $v11         /* src: vacate -> AIR, else cur */
+    sqv  $v01, 0, s0
+    vand  $v05, $v05, $v10         /* carry t1 only where moved */
+    vnor  $v21, $v10, $v10
+    vand  $v02, $v02, $v21
+    vor   $v15, $v05, $v02         /* up = moved ? t1 : up */
+    sqv  $v15, 0, s3
+    j    s_vec
+    nop
+s_done:
+row_next:
     addi s6, s6, -1
-    j    rloop
+    j    row_loop
     nop
-rdone:
+row_done:
     break 0
     nop

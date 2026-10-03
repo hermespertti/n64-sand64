@@ -29,17 +29,18 @@
 #define TOP  8   /* HUD strip height in framebuffer rows */
 
 #ifndef PHASE_MASK
-#define PHASE_MASK 7
+#define PHASE_MASK 15
 #endif
 #ifdef USE_RSP
 #include <rsp.h>
 DEFINE_RSP_UCODE(rsp_sand64);
 /* slab buffer: nsim rows + 1 halo, u16 cells */
-#define NSIM 8
-static uint16_t slab_h[48] __attribute__((aligned(16)));    /* dmem hdr mirror */
+#define NSIM 7
+static uint16_t slab_h[80] __attribute__((aligned(16)));    /* dmem hdr mirror */
 static uint16_t mblk[96] __attribute__((aligned(16)));  /* boundary-mask tables @0xD00 */
 static uint16_t slab_buf[(NSIM + 1) * GW] __attribute__((aligned(16)));
 static uint16_t slab_out[(NSIM + 1) * GW] __attribute__((aligned(16)));
+static uint16_t slab_u0[GW] __attribute__((aligned(16)));   /* grid row ya-1 for ucode S k=0 */
 static long rsp_chunks = 0;
 #endif
 
@@ -278,39 +279,33 @@ static void fused_move(void)
         /* H: strict parallel snapshot (two buffers, matches ucode):
          * nb/movS/curAIR all read the pre-H snapshot; writes go to HOUT.
          * A grain vacating x forbids x+1 chasing into x the same step. */
-        if (!(PHASE_MASK & 4)) continue;
-        memcpy(HROW, &G[y * GW], GW * 2);
-        memcpy(HOUT, HROW, GW * 2);
-        for (int x = 1; x < GW - 1; x++) {
-            uint16_t m = HROW[x];
-            if (!movable(m)) continue;
-            int nx = x + h;
-            if (nx < 1 || nx >= GW - 1) continue;
-            if (HROW[nx] == M_AIR) { HOUT[nx] = m; HOUT[x] = M_AIR; }
+        if (PHASE_MASK & 4) {
+            memcpy(HROW, &G[y * GW], GW * 2);
+            memcpy(HOUT, HROW, GW * 2);
+            for (int x = 1; x < GW - 1; x++) {
+                uint16_t m = HROW[x];
+                if (!movable(m)) continue;
+                int nx = x + h;
+                if (nx < 1 || nx >= GW - 1) continue;
+                if (HROW[nx] == M_AIR) { HOUT[nx] = m; HOUT[x] = M_AIR; }
+            }
+            memcpy(&G[y * GW], HOUT, GW * 2);
         }
-        memcpy(&G[y * GW], HOUT, GW * 2);
-    }
-}
-
-/* smoke rises straight up, one cell/frame (bottom-up scan; V for smoke) */
-static void phase_S(void)
-{
-    for (int y = GH - 2; y >= 1; y--) {
+        /* S (per-row, bottom-up: matches ucode S(k); smoke multi-rises
+         * through the frame exactly like the original phase_S scan). */
+        if (PHASE_MASK & 8)
         for (int x = 1; x < GW - 1; x++) {
-            int i = idx(x, y);
+            int i = idx(x, y), u = idx(x, y - 1);
             if (G[i] != M_SMOKE) continue;
-            if (--TL[i] == 0) { G[i] = M_AIR; continue; }
-            int u = idx(x, y - 1);
-            if (G[u] == M_AIR) { G[u] = M_SMOKE; G[i] = M_AIR; TL[u] = TL[i]; }
-            else if (G[u] != M_SMOKE) {   /* blocked: sideway drift (parity) */
-                int dr = ((frame_no ^ y) & 1) ? 1 : -1;
-                int a = idx(x + dr, y - 1);
-                if (x + dr >= 1 && x + dr < GW - 1 && G[a] == M_AIR)
-                    { G[a] = M_SMOKE; G[i] = M_AIR; TL[a] = TL[i]; }
+            if (G[u] == M_AIR) {
+                if (--TL[i] == 0) { G[i] = M_AIR; continue; }
+                G[u] = M_SMOKE; G[i] = M_AIR; TL[u] = TL[i];
             }
         }
     }
 }
+
+
 
 static int wet3(int x, int y)
 {
@@ -385,6 +380,7 @@ static void probe(const char *line);
 
 #ifdef RSP_VERIFY
 static uint16_t Gcpu[GS] __attribute__((aligned(16)));
+static uint8_t TLcpu[GS] __attribute__((aligned(16)));
 static void phase_V_on(uint16_t *g)
 {
     for (int y = GH - 2; y >= 1; y--)
@@ -436,7 +432,9 @@ static void rsp_v_phase(void)
           h[0] = 0; h[1] = (uint8_t)nsim;
           h[2] = (uint8_t)(frame_no & 1);   /* dirflag: 1 => D d=-1, H h=+1 (matches phase_D/H) */
           h[4] = PHASE_MASK;
-          h[5] = (uint8_t)(ya == 0 ? 1 : 0); }
+          h[5] = (uint8_t)(ya == 0 ? 1 : 0);
+          h[3] = (uint8_t)(frame_no & 1);          /* smoke drift parity base */
+          h[9] = (uint8_t)(ya & 1); }
         /* source-validity masks @DMEM 0xD00 (mblk), slots of 8 u16:
          * [+0] TBL all-FF (interior vectors), [+16] D v0, [+32] D v19,
          * [+48] H v0, [+64] H v19. d=+1: x158 blocked (D v19 j6,7);
@@ -456,10 +454,22 @@ static void rsp_v_phase(void)
             slab_h[24 + i] = 3;   /* THREE @0x30 */
             slab_h[32 + i] = 4;   /* FOUR  @0x40 */
             slab_h[40 + i] = 5;   /* FIVE  @0x50 */
+            slab_h[48 + i] = 0x0700;  /* SM700 @0x60 (unused now) */
+            slab_h[64 + i] = 7;       /* @0x80 SEVEN: smoke material id   -> $v28 */
+            slab_h[72 + i] = 0x00FF;  /* @0x90 FF   : material low mask   -> $v29 */
+            slab_h[56 + i] = 0x0100;  /* @0x70 TLX  : TL one tick         -> $v30 */
         }
         (void)w3; (void)s2; (void)s4;
         /* slab rows ya..yb + halo (yb+1) */
-        memcpy(slab_buf, &G[ya * GW], (nsim + 1) * GW * 2);
+        { const uint16_t *gs = &G[ya * GW];
+          int ncell = (nsim + 1) * GW;
+          /* halo = grid row yb+1 (BELOW chunk): V/D/H write it; decode it back.
+             S's 'up' row (yb+1 too? NO: up = row above chunk top = U0, read
+             separately after this loop, which then wins for that one row). */
+          for (int i = 0; i < ncell; i++)
+              slab_buf[i] = (uint16_t)((gs[i] & 0xFF) | ((gs[i] & 0xFF) == M_SMOKE ? (TL[i + ya * GW] << 8) : 0)); }
+          /* smoke-only high byte is LOAD-BEARING: ucode S tests smoke as
+             (s16)cur >= 0x0700; any non-smoke TL byte would poison it. */
 #ifdef RSP_VERIFY
         if (rsp_chunks == 0) {
             char ln[220]; int o = snprintf(ln, sizeof ln, "[vin ]");
@@ -472,8 +482,15 @@ static void rsp_v_phase(void)
 #ifdef RSP_PROF
         uint64_t tA = TIMER_MICROS_LL(timer_ticks());
 #endif
-        rsp_load_data(slab_h, 96, 0x0000);
+        rsp_load_data(slab_h, 160, 0x0000);
         rsp_load_data(slab_buf, (nsim + 1) * GW * 2, 0x0080);
+        if (ya > 0) {
+            const uint16_t *us = &G[(ya - 1) * GW];   /* k=0 up-target = row ABOVE chunk */
+            for (int x = 0; x < GW; x++)
+                slab_u0[x] = (uint16_t)((us[x] & 0xFF) | ((us[x] & 0xFF) == M_SMOKE ? (TL[(ya - 1) * GW + x] << 8) : 0));
+            data_cache_hit_writeback_invalidate(slab_u0, sizeof slab_u0);
+            rsp_load_data(slab_u0, GW * 2, 0x0A80);
+        }
         data_cache_hit_writeback_invalidate(mblk, sizeof mblk);
         rsp_load_data(mblk, sizeof mblk, 0x0D00);
 #ifdef RSP_TRACE
@@ -573,6 +590,8 @@ static void rsp_v_phase(void)
         { /* fused oracle: apply V(row),D(row),H(row) bottom-up on slab copy, match ucode */
             static uint16_t want[(NSIM + 1) * GW];
             static uint16_t snap[GW];
+            static uint16_t mu0[GW]; static uint16_t u0b2[GW] __attribute__((aligned(16)));
+            if (ya > 0) memcpy(mu0, slab_u0, sizeof mu0);
             int ddir = (frame_no & 1) ? -1 : 1;
             int hdir = -ddir;
             memcpy(want, slab_buf, (nsim + 1) * GW * 2);
@@ -612,10 +631,29 @@ static void rsp_v_phase(void)
             noH:;
             noD:;
             noV:;
+            /* S (encoded): per-row after H; TL rides high byte */
+            if (PHASE_MASK & 8)
+            for (int x = 1; x < GW - 1; x++) {
+                int i = y * GW + x;
+                if ((want[i] & 0xFF) != M_SMOKE) continue;
+                uint16_t uw = (y == 0) ? mu0[x] : want[(y - 1) * GW + x];
+                if ((uw & 0xFF) != M_AIR) continue;       /* blocked: TL held */
+                int tlv = (int)(want[i] >> 8) - 1;
+                if (tlv <= 0) { want[i] = M_AIR; continue; }
+                if (y > 0) want[(y - 1) * GW + x] = (uint16_t)(M_SMOKE | (tlv << 8));
+                else mu0[x] = (uint16_t)(M_SMOKE | (tlv << 8));  /* y==0 -> U0 */
+                want[i] = M_AIR;
+            }
             }
             long mm = 0; int fx = -1;
             for (int i = 0; i < nsim * GW; i++)          /* source rows k=0..nsim-1 (halo k=nsim is pre-move on RSP side) */
                 if (slab_out[i] != want[i]) { mm++; if (fx < 0) fx = i; }
+            if (ya > 0) {
+                rsp_read_data(u0b2, GW * 2, 0x0A80);
+                data_cache_hit_writeback_invalidate(u0b2, sizeof u0b2);
+                for (int x = 0; x < GW; x++)
+                    if (u0b2[x] != mu0[x]) { mm++; if (fx < 0) fx = x; }
+            }
             mism_total += mm;
             static int dumpbudget = 10;
             if (mm && dumpbudget > 0) {
@@ -624,13 +662,13 @@ static void rsp_v_phase(void)
                 char ln[220];
                 int r = fx / GW, xc = fx % GW, base = r * GW + (xc < 16 ? 0 : xc - 16);
                 int o = snprintf(ln, sizeof ln, "[WANT] ya=%d d=%d r=%d x0=%d:", ya, ddir, r, base - r * GW);
-                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, "%u", want[i]);
+                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, " %u", want[i]);
                 probe(ln);
                 o = snprintf(ln, sizeof ln, "[WOUT]");
-                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, "%u", slab_out[i]);
+                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_out[i]);
                 probe(ln);
                 o = snprintf(ln, sizeof ln, "[WIN ]");
-                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, "%u", slab_buf[i]);
+                for (int i = base; i < base + 32 && o < 212; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_buf[i]);
                 probe(ln);
                 int nb = base + GW;   /* row below in slab */
                 o = snprintf(ln, sizeof ln, "[WNBW]");
@@ -653,7 +691,7 @@ static void rsp_v_phase(void)
                 char ln[220];
                 int base = (fx / GW) * GW + (fx % GW) - 16;
                 int o = snprintf(ln, sizeof ln, "[zou] f=%d y%d x%d:", frame_no, fx / GW, base - (fx/GW)*GW);
-                for (int i = base; i < base + 32 && o < 210; i++) o += snprintf(ln + o, sizeof ln - o, "%u", slab_out[i]);
+                for (int i = base; i < base + 16 && o < 200; i++) o += snprintf(ln + o, sizeof ln - o, " %u", slab_out[i]);
                 probe(ln);
                 o = snprintf(ln, sizeof ln, "[zwt]");
                 for (int i = base; i < base + 32 && o < 210; i++) o += snprintf(ln + o, sizeof ln - o, "%u", want[i]);
@@ -687,7 +725,29 @@ static void rsp_v_phase(void)
             }
         }
 #endif
-        memcpy(&G[ya * GW], slab_out, (nsim + 1) * GW * 2);
+        { uint16_t *gd = &G[ya * GW];
+          int ncell = (nsim + 1) * GW;
+          for (int i = 0; i < ncell; i++) {
+              uint16_t v = slab_out[i];
+              uint8_t lo = (uint8_t)v;
+              gd[i] = lo;
+              if (lo == M_SMOKE) TL[i + ya * GW] = (uint8_t)(v >> 8);
+          } }
+        if (ya > 0) {
+            /* U0 readback: smoke the RSP moved up out of chunk row 0 lives ONLY
+               here (the chunk above was already read back). Without this the
+               cross-chunk rise is lost. */
+            static uint16_t u0b[GW] __attribute__((aligned(16)));
+            rsp_read_data(u0b, GW * 2, 0x0A80);
+            data_cache_hit_writeback_invalidate(u0b, sizeof u0b);
+            uint16_t *gu = &G[(ya - 1) * GW];
+            uint8_t *tu = &TL[(ya - 1) * GW];
+            for (int x = 0; x < GW; x++) {
+                uint8_t lo = (uint8_t)u0b[x];
+                gu[x] = lo;
+                if (lo == M_SMOKE) tu[x] = (uint8_t)(u0b[x] >> 8);
+            }
+        }
         rsp_chunks++;
     }
 }
@@ -715,10 +775,10 @@ static void step(void)
     memcpy(Gcpu, Gpre, sizeof Gcpu);
     {
         fused_move();                          /* G = CPU-fused(Gpre) */
-        phase_S();
         transform_phase();
         fire_phase();
         memcpy(Gcpu, G, sizeof Gcpu);          /* full CPU step */
+        memcpy(TLcpu, TL, sizeof TLcpu);       /* its TL plane too */
         memcpy(G, Gpre, sizeof Gpre);          /* restore grid, TL, rng for RSP */
         memcpy(TL, TLpre, sizeof TLpre);
         RNGSEED = rng_pre;
@@ -729,20 +789,17 @@ static void step(void)
     erase_water = ew_pre; spawn_water = sw_pre;
     erase_sand = es_pre; spawn_sand = ss_pre; spawn_seed = sp_pre;
     rsp_v_phase();                             /* G = RSP-fused(Gpre) */
-    phase_S();
     transform_phase();
     fire_phase();
     rsp_verify("VDH");                         /* compare AFTER identical post-move phases */
 #else
     rsp_v_phase();
-    phase_S();
     transform_phase();
     fire_phase();
 #endif
 #elif defined(PHASE_PROF)
     uint64_t t;
     t = TIMER_MICROS_LL(timer_ticks()); fused_move(); us_D += TIMER_MICROS_LL(timer_ticks()) - t;
-    t = TIMER_MICROS_LL(timer_ticks()); phase_S(); us_S += TIMER_MICROS_LL(timer_ticks()) - t;
     t = TIMER_MICROS_LL(timer_ticks()); transform_phase(); us_T += TIMER_MICROS_LL(timer_ticks()) - t;
     t = TIMER_MICROS_LL(timer_ticks()); fire_phase(); us_F += TIMER_MICROS_LL(timer_ticks()) - t;
     if (frame_no > 0 && (frame_no % 60) == 60 - 1) {
@@ -755,8 +812,7 @@ static void step(void)
 #ifdef AUTOTEST
     { int w0, wa, wb, wc, wd;
       long e0 = erase_water, s0 = spawn_water;
-      w0 = water_cnt(); fused_move();    wa = water_cnt();
-      phase_S();                          wb = water_cnt();
+      w0 = water_cnt(); fused_move();    wa = water_cnt();                          wb = water_cnt();
       long e1 = erase_water, s1 = spawn_water;
       transform_phase();                  wc = water_cnt();
       long e2 = erase_water, s2 = spawn_water;
@@ -775,7 +831,6 @@ static void step(void)
     }
 #else
     fused_move();
-    phase_S();
     transform_phase();
     fire_phase();
 #endif
